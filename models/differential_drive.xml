@@ -22,6 +22,8 @@
       <!-- +x is forward; +y is left. Wheel radius 6 cm, track 30 cm. -->
       <geom name="front_marker" type="box" pos="0.13 0 0.041" size="0.025 0.065 0.006" mass="0.01" rgba="1 0.55 0.12 1" contype="0" conaffinity="0"/>
       <site name="imu" pos="0 0 0.04" size="0.008" rgba="1 1 1 1"/>
+      <!-- Axle midpoint: the point the robot turns about; the tracked pose. -->
+      <site name="axle" pos="-0.10 0 -0.04" size="0.008" rgba="1 0.55 0.12 1"/>
       <body name="left_wheel" pos="-0.10 0.15 -0.04">
         <joint name="left_wheel_joint" type="hinge" axis="0 1 0"/>
         <geom type="cylinder" size="0.06 0.02" euler="1.57079632679 0 0" mass="0.15" rgba="0.08 0.09 0.1 1"/>

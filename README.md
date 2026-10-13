@@ -30,39 +30,70 @@ source .venv/bin/activate
 python app.py
 ```
 
-The PySide6 (Qt) app has one **Launch simulation** button. It opens the
-robot in its own MuJoCo window (`viewer.py`, run under `mjpython` on macOS)
-and links to it over the process's stdin/stdout: the window reports `ready`,
-then streams readings at 10 Hz of simulation time. The app shows the link
-status and:
+One window, three columns:
 
-- **Pose** (ground truth): x, y (m) and heading (°, counterclockwise from +x).
-- **Motion** (ground truth): forward speed (m/s) and turn rate (°/s).
-- **Wheel encoders:** total wheel angle (rad) and wheel speed (rad/s).
-- **IMU:** gyro z, the yaw rate (rad/s), and accelerometer x, y (m/s², body frame).
+- **Setup** (left): route, position-fix noise σ, fix rate and gyro noise σ.
+  Click **Launch** to open the robot in its own MuJoCo window; the button
+  becomes **Stop**. Setup is locked while running. **Speed** (1×–10×) can be
+  changed while running.
+- **Plot** (middle): top-down true path, dead reckoning, EKF and the noisy
+  position fixes, in metres.
+- **Error vs. true position** (right): current and RMS position error (m) and
+  heading error (°) for dead reckoning and the EKF. **Sensor readings**
+  expands to show time, true pose, wheel angles, gyro and the last fix.
 
-Gyro x/y and accelerometer z are left out: on flat ground they stay near
-0, 0 and 9.81 m/s². Closing the MuJoCo window resets the app to launch again;
-closing the app closes the simulation window.
+### Routes
 
-There are no drive controls or recordings in the app yet. `simulation.py` and
-`database.py` (sensor noise and SQLite logging) remain for later steps.
+The robot follows its route with a closed-loop autopilot using the true pose
+(`robot.RouteFollower`), turning on the spot at corners. Corner points are
+fixed from the start pose, so laps repeat without drifting.
 
-## Drive the robot
+- **Square:** 1 m sides, 90° turns.
+- **Hexagon:** 0.6 m sides, 60° turns.
+- **Figure 8:** two 0.4 m-radius circles, left then right.
 
-```sh
-source .venv/bin/activate
-mjpython simulate.py
-```
+### Sensors
 
-Click the 3D simulation view, then use **↑/↓** to move forward/reverse,
-**←/→** to turn left/right, and **Space** to stop. Commands persist until
-another key is pressed; wheel speeds ramp smoothly.
-The orange stripe marks the front (+x).
+Every 0.05 s (20 Hz of simulation time) the simulation sends ground truth and
+sensor readings to the app over stdout (`robot.FIELDS`). Poses are of the axle
+midpoint, the point the robot turns about.
 
-The model has two independently driven 6 cm rear wheels, a 30 cm wheel track,
-and a front low-friction ball support approximating a caster. Wheel velocity,
-gyro, accelerometer, and ground-truth pose outputs are available without
-added sensor noise. The Python runner prints pose every two seconds.
+- **Wheel encoders:** total wheel angles (rad), noise-free. Their error comes
+  from wheel slip, mostly during turns.
+- **Gyro:** yaw rate (rad/s) plus Gaussian noise σ.
+- **Position fix:** true x, y plus Gaussian noise σ (m), at the fix rate
+  (like a GPS or beacon).
 
-Run the headless motion checks with `python -m pytest -q`.
+Noise uses a fixed seed (42), so the same settings give the same run.
+
+### Estimators
+
+Both start from the known initial pose.
+
+- **Dead reckoning** (`dead_reckoning.py`): wheel encoders only. Each step
+  moves `d = r(ΔL+ΔR)/2` and turns `Δθ = r(ΔR−ΔL)/b` (wheel radius `r` =
+  0.06 m, track `b` = 0.30 m), using the midpoint heading. Errors are never
+  corrected.
+- **EKF** (`ekf.py`), state `[x, y, θ]`:
+  - *Predict:* distance `d` from the encoders and heading change from the
+    gyro (trapezoid of consecutive readings × 0.05 s), so wheel slip in turns
+    does not corrupt heading. Covariance `P = F P Fᵀ + G M Gᵀ + Q_slip`, with
+    `M = diag((0.02·d)², (σ_gyro·Δt)²)`.
+  - *Update* on each position fix: `H = [[1,0,0],[0,1,0]]`, `R = σ_fix² I`,
+    gain `K = P Hᵀ (H P Hᵀ + R)⁻¹`, Joseph-form covariance update.
+  - Noise levels are fixed and known; the Adaptive EKF will estimate them.
+
+`localization.Tracker` runs both estimators on each sample and keeps the
+paths and error statistics shown in the app.
+
+## Robot model
+
+`models/differential_drive.xml`: two independently driven 6 cm rear wheels,
+a 30 cm wheel track, and a front low-friction ball support approximating a
+caster. The orange stripe marks the front (+x); the orange dot between the
+wheels is the axle midpoint used as the robot's pose.
+
+`simulate.py` is an older standalone demo that drives the robot with the
+arrow keys (`mjpython simulate.py`); the app does not use it.
+
+Run the tests with `.venv/bin/python -m pytest -q`.

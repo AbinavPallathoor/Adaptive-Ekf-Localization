@@ -1,0 +1,9 @@
+mujoco
+numpy
+pandas
+scipy
+matplotlib
+jupyterlab
+ipykernel
+pytest
+PySide6-Essentials

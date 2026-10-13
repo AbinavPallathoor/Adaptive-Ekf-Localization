@@ -1,0 +1,51 @@
+<mujoco model="Simple differential drive">
+  <compiler angle="radian"/>
+  <option timestep="0.002" integrator="implicitfast"/>
+  <visual>
+    <global azimuth="135" elevation="-30" offwidth="900" offheight="600"/>
+    <headlight ambient="0.4 0.4 0.4" diffuse="0.7 0.7 0.7"/>
+  </visual>
+  <default>
+    <joint damping="0.02" armature="0.001"/>
+    <geom friction="1 0.005 0.0001" condim="3"/>
+  </default>
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" rgb1="0.19 0.23 0.28" rgb2="0.24 0.29 0.34" width="512" height="512"/>
+    <material name="floor" texture="grid" texrepeat="12 12" texuniform="true" reflectance="0.05"/>
+  </asset>
+  <worldbody>
+    <light pos="0 0 4" dir="0 0 -1"/>
+    <geom name="ground" type="plane" size="6 6 0.1" material="floor"/>
+    <body name="robot" pos="0 0 0.105">
+      <freejoint name="base"/>
+      <geom name="chassis" type="box" size="0.16 0.115 0.035" mass="2" rgba="0.1 0.55 0.75 1"/>
+      <!-- +x is forward; +y is left. Wheel radius 6 cm, track 30 cm. -->
+      <geom name="front_marker" type="box" pos="0.13 0 0.041" size="0.025 0.065 0.006" mass="0.01" rgba="1 0.55 0.12 1" contype="0" conaffinity="0"/>
+      <site name="imu" pos="0 0 0.04" size="0.008" rgba="1 1 1 1"/>
+      <body name="left_wheel" pos="-0.10 0.15 -0.04">
+        <joint name="left_wheel_joint" type="hinge" axis="0 1 0"/>
+        <geom type="cylinder" size="0.06 0.02" euler="1.57079632679 0 0" mass="0.15" rgba="0.08 0.09 0.1 1"/>
+        <geom type="box" size="0.045 0.021 0.004" mass="0.001" rgba="0.8 0.85 0.9 1" contype="0" conaffinity="0"/>
+      </body>
+      <body name="right_wheel" pos="-0.10 -0.15 -0.04">
+        <joint name="right_wheel_joint" type="hinge" axis="0 1 0"/>
+        <geom type="cylinder" size="0.06 0.02" euler="1.57079632679 0 0" mass="0.15" rgba="0.08 0.09 0.1 1"/>
+        <geom type="box" size="0.045 0.021 0.004" mass="0.001" rgba="0.8 0.85 0.9 1" contype="0" conaffinity="0"/>
+      </body>
+      <!-- Low-friction ball support approximates a passive caster. -->
+      <geom name="caster" type="sphere" pos="0.125 0 -0.075" size="0.025" mass="0.05" friction="0.001 0.0001 0.0001" priority="1" rgba="0.6 0.65 0.7 1"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <velocity name="left_motor" joint="left_wheel_joint" kv="0.5" ctrlrange="-12 12" forcerange="-2 2"/>
+    <velocity name="right_motor" joint="right_wheel_joint" kv="0.5" ctrlrange="-12 12" forcerange="-2 2"/>
+  </actuator>
+  <sensor>
+    <jointvel name="left_encoder" joint="left_wheel_joint"/>
+    <jointvel name="right_encoder" joint="right_wheel_joint"/>
+    <gyro name="gyro" site="imu"/>
+    <accelerometer name="accelerometer" site="imu"/>
+    <framepos name="ground_truth_position" objtype="body" objname="robot"/>
+    <framequat name="ground_truth_orientation" objtype="body" objname="robot"/>
+  </sensor>
+</mujoco>

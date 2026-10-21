@@ -134,7 +134,9 @@ class LivePage(QWidget):
 
     def build_errors(self):
         group = QGroupBox('Position error (m)')
-        grid = QGridLayout(group)
+        column = QVBoxLayout(group)
+        grid = QGridLayout()
+        column.addLayout(grid)
         for col, (kind, heading) in enumerate((('now', 'Now'), ('rms', 'RMS')), start=1):
             header = value_label(heading, ERROR_TIPS[kind])
             header.setObjectName('heading')
@@ -149,7 +151,7 @@ class LivePage(QWidget):
         self.verdict = QLabel('Launch a run to compare the methods.')
         self.verdict.setObjectName('verdict')
         self.verdict.setWordWrap(True)
-        grid.addWidget(self.verdict, 4, 0, 1, 3)
+        column.addWidget(self.verdict)
         return group
 
     def build_settings(self):

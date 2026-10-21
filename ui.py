@@ -95,7 +95,7 @@ QLabel#help {{ font-size: 13px; line-height: 150%; padding: 4px 8px 16px 4px; }}
 QRadioButton {{ spacing: 8px; padding: 2px 0; }}
 QRadioButton::indicator {{ width: 14px; height: 14px; border-radius: 8px;
     border: 1px solid {t['border']}; background: {t['input']}; }}
-QRadioButton::indicator:checked {{ border: 4px solid {t['accent']}; background: {t['input']}; }}
+QRadioButton::indicator:checked {{ width: 8px; height: 8px; border: 4px solid {t['accent']}; }}
 
 QPushButton#segment {{ padding: 6px 10px; font-weight: 600; color: {t['muted']}; }}
 QPushButton#segment:checked {{ background: {t['accent']}; border-color: {t['accent']}; color: white; }}

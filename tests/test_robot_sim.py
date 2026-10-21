@@ -76,7 +76,33 @@ def test_zero_noise_sensors_match_truth():
     assert sample['gyro_z'] == truth['gyro_z']
 
 
-def test_speed_commands():
-    assert robot.parse_command('speed 5') == 5
+def test_commands():
+    assert robot.parse_command('speed 5') == ('speed', 5)
     assert robot.parse_command('speed 0') is None
-    assert robot.parse_command('nonsense') is None
+    assert robot.parse_command('fix_noise 0.25') == ('fix_noise', .25)
+    assert robot.parse_command('gyro_noise 0') == ('gyro_noise', 0)
+    for bad in ('fix_noise -0.1', 'fix_noise nan', 'gyro_noise 5', 'fix_noise x', 'nonsense'):
+        assert robot.parse_command(bad) is None
+
+
+def test_samples_report_the_noise_in_force():
+    model, data = robot.load()
+    sensors = robot.Sensors(seed=0, gyro_noise=.01, fix_noise=.1, fix_rate=1)
+    assert sensors.sample(robot.readings(data))['fix_sigma'] == .1
+    sensors.set_noise(fix_noise=.4)
+    sample = sensors.sample(robot.readings(data))
+    assert (sample['fix_sigma'], sample['gyro_sigma']) == (.4, .01)
+
+
+def test_noise_step_happens_once_at_its_time():
+    sensors = robot.Sensors(seed=0, gyro_noise=.01, fix_noise=.1, fix_rate=1)
+    step = robot.NoiseStep(30, fix_noise=.3)
+    step.apply(sensors, 29.95)
+    assert sensors.fix_noise == .1
+    step.apply(sensors, 30)
+    assert (sensors.fix_noise, sensors.gyro_noise) == (.3, .01)
+    sensors.set_noise(fix_noise=.2)
+    step.apply(sensors, 40)
+    assert sensors.fix_noise == .2
+    robot.NoiseStep(None).apply(sensors, 100)
+    assert sensors.fix_noise == .2

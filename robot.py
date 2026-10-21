@@ -25,7 +25,11 @@ ROUTES = {
     'hexagon': [('straight', .6), ('turn', math.pi/3)] * 6,
     'figure8': [('arc', .4, math.tau), ('arc', .4, -math.tau)],
 }
-FIELDS = ('time', 'x', 'y', 'heading', 'left_angle', 'right_angle', 'gyro_z', 'fix_x', 'fix_y')
+MAX_NOISE = {'fix_noise': 1.0, 'gyro_noise': .5}  # largest σ the app offers (m, rad/s)
+# fix_sigma and gyro_sigma (the true noise σ in force) and fix_outlier (1 for a bad
+# fix) are ground truth, for comparison only.
+FIELDS = ('time', 'x', 'y', 'heading', 'left_angle', 'right_angle', 'gyro_z', 'fix_x', 'fix_y',
+          'fix_sigma', 'gyro_sigma', 'fix_outlier')
 
 DRIVE_SPEED = 4  # rad/s wheel speed on straights and arcs (0.24 m/s)
 TURN_SPEED = 3  # rad/s wheel speed when turning on the spot
@@ -56,22 +60,67 @@ def readings(data):
 
 
 class Sensors:
-    """Adds seeded Gaussian noise to the gyro and produces noisy position fixes."""
+    """Turns ground truth into sensor readings with seeded, controllable errors.
 
-    def __init__(self, seed, gyro_noise, fix_noise, fix_rate):
-        self.rng = np.random.default_rng(seed)
+    Gyro: Gaussian noise σ. Position fixes: Gaussian noise σ at the fix rate;
+    a fraction outlier_rate of them are bad fixes with σ outlier_noise instead.
+    Wheel encoders: slip makes each wheel turn further than the robot moves,
+    so each sample's wheel-angle change is over-read by a fraction |N(0, slip)|.
+    Each effect has its own random stream, so adding one leaves the others unchanged.
+    """
+
+    def __init__(self, seed, gyro_noise, fix_noise, fix_rate, outlier_rate=0., outlier_noise=1., slip=0.):
+        self.gyro_rng, self.fix_rng, self.outlier_rng, self.slip_rng = (
+            np.random.default_rng(stream) for stream in np.random.SeedSequence(seed).spawn(4))
         self.gyro_noise, self.fix_noise = gyro_noise, fix_noise
+        self.outlier_rate, self.outlier_noise, self.slip = outlier_rate, outlier_noise, slip
         self.fix_every = round(1 / (fix_rate * SAMPLE_PERIOD))
         self.count = 0
+        self.wheels = None  # last true and reported wheel angles
+
+    def set_noise(self, gyro_noise=None, fix_noise=None):
+        """Change the noise σ from the next sample on; None keeps the current value."""
+        if gyro_noise is not None:
+            self.gyro_noise = gyro_noise
+        if fix_noise is not None:
+            self.fix_noise = fix_noise
 
     def sample(self, truth):
-        gyro = truth['gyro_z'] + self.rng.normal(0, self.gyro_noise)
+        gyro = truth['gyro_z'] + self.gyro_rng.normal(0, self.gyro_noise)
         fix_x = fix_y = None
+        outlier = False
         if self.count % self.fix_every == 0:
+            outlier = bool(self.outlier_rng.random() < self.outlier_rate)
+            sigma = self.outlier_noise if outlier else self.fix_noise
             fix_x, fix_y = (float(v) for v in np.array([truth['x'], truth['y']])
-                            + self.rng.normal(0, self.fix_noise, 2))
+                            + self.fix_rng.normal(0, sigma, 2))
         self.count += 1
-        return {**truth, 'gyro_z': float(gyro), 'fix_x': fix_x, 'fix_y': fix_y}
+        true_wheels = np.array([truth['left_angle'], truth['right_angle']])
+        if self.wheels is None:
+            reported = true_wheels
+        else:
+            last_true, last_reported = self.wheels
+            change = true_wheels - last_true
+            reported = last_reported + change*(1 + np.abs(self.slip_rng.normal(0, self.slip, 2)))
+        self.wheels = true_wheels, reported
+        return {**truth, 'gyro_z': float(gyro), 'fix_x': fix_x, 'fix_y': fix_y,
+                'left_angle': float(reported[0]), 'right_angle': float(reported[1]),
+                'fix_sigma': float(self.fix_noise), 'gyro_sigma': float(self.gyro_noise),
+                'fix_outlier': float(outlier)}
+
+
+class NoiseStep:
+    """Scripted change of sensor noise once simulation time reaches a set time."""
+
+    def __init__(self, time, gyro_noise=None, fix_noise=None):
+        self.time, self.gyro_noise, self.fix_noise = time, gyro_noise, fix_noise
+        self.done = time is None
+
+    def apply(self, sensors, now):
+        """Change the sensors' noise the first time now ≥ the step time."""
+        if not self.done and now >= self.time:
+            sensors.set_noise(self.gyro_noise, self.fix_noise)
+            self.done = True
 
 
 def wrap(angle):
@@ -174,10 +223,17 @@ def apply_target(model, data, target, nstep):
 
 
 def parse_command(line):
-    """Return the speed-up factor from a 'speed N' line, or None if invalid."""
+    """Parse 'speed N', 'fix_noise σ' or 'gyro_noise σ' into (name, value); None if invalid."""
     match line.split():
         case ['speed', value] if value.isdigit() and int(value) in SPEEDS:
-            return int(value)
+            return 'speed', int(value)
+        case [('fix_noise' | 'gyro_noise') as name, value]:
+            try:
+                sigma = float(value)
+            except ValueError:
+                return None
+            if 0 <= sigma <= MAX_NOISE[name]:
+                return name, sigma
     return None
 
 

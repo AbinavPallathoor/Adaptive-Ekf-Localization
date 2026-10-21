@@ -1,40 +1,34 @@
-"""Desktop app: launch a route in MuJoCo and compare dead reckoning with the EKF.
+"""Desktop app: watch dead reckoning, the EKF and the Adaptive EKF live, and test them statistically.
 
 Launch with: .venv/bin/python app.py
 """
 
-import math
 from pathlib import Path
 import sys
-import time
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.figure import Figure
 from PySide6.QtCore import QProcess, Qt
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QMainWindow, QPushButton, QToolButton, QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
+    QLabel, QMainWindow, QPushButton, QRadioButton, QSpinBox, QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
-from localization import Tracker
+from ekf import MEMORY, EKFSettings
+from experiment_page import ExperimentPage
+from help_text import ERROR_TIPS, HELP, TIPS
+from localization import NAMES, Tracker
+from plots import NoisePlot, PathPlot
 import robot
+from scenarios import BY_KEY, SCENARIOS
+from ui import ROUTE_NAMES, SIDEBAR_WIDTH, THEMES, SliderField, add_row, note, scrolling, section, stylesheet, value_label
 
 ROOT = Path(__file__).resolve().parent
-SEED = 42
-ROUTE_NAMES = {'square': 'Square', 'hexagon': 'Hexagon', 'figure8': 'Figure 8'}
-# Sensor readouts: (field, label, scale, decimals); hidden until expanded.
-SENSORS = [('time', 'Time (s)', 1, 2), ('x', 'True x (m)', 1, 3), ('y', 'True y (m)', 1, 3),
-           ('heading', 'True heading (°)', 180/math.pi, 1),
-           ('left_angle', 'Left wheel (rad)', 1, 2), ('right_angle', 'Right wheel (rad)', 1, 2),
-           ('gyro_z', 'Gyro z (rad/s)', 1, 3), ('fix_x', 'Last fix x (m)', 1, 3),
-           ('fix_y', 'Last fix y (m)', 1, 3)]
-# Validated categorical slots 1-3 and text/surface steps, light and dark.
-THEMES = {
-    'light': {'surface': '#fcfcfb', 'text': '#0b0b0b', 'muted': '#52514e', 'grid': '#e4e3df',
-              'fix': '#9a9893', 'true': '#2a78d6', 'dr': '#eb6834', 'ekf': '#1baf7a'},
-    'dark': {'surface': '#1a1a19', 'text': '#ffffff', 'muted': '#c3c2b7', 'grid': '#33332f',
-             'fix': '#77756e', 'true': '#3987e5', 'dr': '#d95926', 'ekf': '#199e70'},
-}
+# Filter tuning fields: (setting, label, maximum, step, decimals, display units per setting unit).
+TUNING = [('fix_noise', 'Fix σ (m)', 2, .01, 3, 1),
+          ('gyro_noise', 'Gyro σ (rad/s)', 1, .001, 3, 1),
+          ('distance_noise', 'Distance σ (%)', 50, .5, 1, 100),
+          ('slip_noise', 'Slip σ (mm/step)', 20, .1, 2, 1000),
+          ('initial_sigma', 'Initial σ', 1, .001, 3, 1)]
+VERDICT_AFTER = 10  # s of simulation before comparing the filters' errors
 
 
 def default_viewer_command():
@@ -45,196 +39,272 @@ def default_viewer_command():
     return [sys.executable, *launcher, str(ROOT / 'viewer.py')]
 
 
-class PathPlot(FigureCanvasQTAgg):
-    """Top-down true path, both estimates and the position fixes, in metres."""
+class LivePage(QWidget):
+    """Pick a route and a scenario, launch the MuJoCo window and watch the estimators."""
 
-    def __init__(self, theme):
-        figure = Figure(facecolor=theme['surface'])
-        # Fixed margins: automatic layout would shift the axes as tick labels change.
-        figure.subplots_adjust(left=.15, right=.97, bottom=.1, top=.86)
-        super().__init__(figure)
-        self.setMinimumSize(420, 380)
-        self.axes = figure.add_subplot(facecolor=theme['surface'])
-        self.axes.set_aspect('equal', adjustable='box')
-        self.axes.set_xlabel('x (m)', color=theme['muted'])
-        self.axes.set_ylabel('y (m)', color=theme['muted'])
-        self.axes.tick_params(colors=theme['muted'], length=0)
-        self.axes.grid(color=theme['grid'], linewidth=.8)
-        for spine in self.axes.spines.values():
-            spine.set_visible(False)
-        self.fix_dots, = self.axes.plot([], [], linestyle='none', marker='o', markersize=3,
-                                        color=theme['fix'], label='Position fixes')
-        # The EKF usually sits on the true path: draw it wider underneath so both show.
-        self.ekf_line, = self.axes.plot([], [], color=theme['ekf'], linewidth=4, label='EKF')
-        self.dr_line, = self.axes.plot([], [], color=theme['dr'], linewidth=2,
-                                       linestyle=(0, (5, 3)), label='Dead reckoning')
-        self.true_line, = self.axes.plot([], [], color=theme['true'], linewidth=1.5, label='True path')
-        marker = dict(marker='o', markersize=9, markeredgewidth=2, markeredgecolor=theme['surface'])
-        self.markers = [self.axes.plot([], [], color=theme[name], **marker)[0] for name in ('true', 'dr', 'ekf')]
-        # Legend in two rows above the plot, so it never covers the path.
-        handles = [self.true_line, self.dr_line, self.ekf_line, self.fix_dots]
-        self.axes.legend(handles=handles, loc='lower left', bbox_to_anchor=(0, 1.01), ncol=2,
-                         frameon=False, labelcolor=theme['text'], fontsize=9,
-                         handlelength=2.2, columnspacing=1.2, borderaxespad=0)
-        self.last_draw = 0.0
-        self.clear()
-
-    def clear(self):
-        for line in (self.fix_dots, self.true_line, self.dr_line, self.ekf_line, *self.markers):
-            line.set_data([], [])
-        self.axes.set_xlim(-.7, .7)
-        self.axes.set_ylim(-.7, .7)
-        self.draw_idle()
-
-    def refresh(self, tracker, force=False):
-        """Redraw from the tracker's paths, at most 10 times a second."""
-        if not force and time.monotonic() - self.last_draw < .1:
-            return
-        self.last_draw = time.monotonic()
-        self.fix_dots.set_data(*tracker.fixes)
-        paths = (tracker.true_path, tracker.dr_path, tracker.ekf_path)
-        for line, marker, (xs, ys) in zip((self.true_line, self.dr_line, self.ekf_line), self.markers, paths):
-            line.set_data(xs, ys)
-            marker.set_data(xs[-1:], ys[-1:])
-        xs = [x for path in paths for x in path[0]]
-        ys = [y for path in paths for y in path[1]]
-        # At least a 1.4 m view so the start doesn't look zoomed in; position fixes may fall outside.
-        span = max(1.4, max(xs) - min(xs) + .4, max(ys) - min(ys) + .4)
-        cx, cy = (max(xs) + min(xs))/2, (max(ys) + min(ys))/2
-        self.axes.set_xlim(cx - span/2, cx + span/2)
-        self.axes.set_ylim(cy - span/2, cy + span/2)
-        self.draw_idle()
-
-
-class MainWindow(QMainWindow):
-    def __init__(self, viewer_command=None):
+    def __init__(self, theme, status, viewer_command=None):
         super().__init__()
+        self.status = status
         self.viewer_command = viewer_command or default_viewer_command()
         self.process = None
-        self.tracker = Tracker(fix_noise=.1, gyro_noise=.01)
-        self.last_fix = {'fix_x': None, 'fix_y': None}
+        self.tracker = Tracker()
         self.latest = None
-        self.setWindowTitle('Adaptive EKF Localization')
-        self.resize(1280, 760)
-        root = QWidget()
-        layout = QHBoxLayout(root)
-        layout.addWidget(self.build_controls())
-        dark = QApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
-        self.plot = PathPlot(THEMES['dark' if dark else 'light'])
-        layout.addWidget(self.plot, 1)
-        layout.addWidget(self.build_results())
-        self.setCentralWidget(root)
-        self.status = QLabel('Not running')
-        self.statusBar().addWidget(self.status)
+        self.step_pending = False
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+        layout.addWidget(self.build_sidebar())
+        plots = QVBoxLayout()
+        plots.setSpacing(6)
+        self.plot = PathPlot(theme)
+        plots.addWidget(self.plot, 1)
+        self.noise_plot = NoisePlot(theme)
+        plots.addWidget(self.noise_plot)
+        layout.addLayout(plots, 1)
+        self.choose_scenario(SCENARIOS[0].key)
 
-    def build_controls(self):
-        panel = QWidget()
-        panel.setFixedWidth(250)
-        column = QVBoxLayout(panel)
-        column.setContentsMargins(0, 0, 0, 0)
-        self.setup = QGroupBox('Setup')
-        form = QFormLayout(self.setup)
-        self.route = QComboBox()
+    # Layout
+
+    def build_sidebar(self):
+        page = QWidget()
+        column = QVBoxLayout(page)
+        column.setContentsMargins(2, 4, 8, 4)
+        column.setSpacing(8)
+        column.addWidget(section('1  Route'))
+        routes = QHBoxLayout()
+        routes.setSpacing(6)
+        self.routes = QButtonGroup(self)
         for key, name in ROUTE_NAMES.items():
-            self.route.addItem(name, key)
-        form.addRow('Route', self.route)
-        self.fix_noise = self.spin_box(0, 1, .01, .10)
-        form.addRow('Position fix σ (m)', self.fix_noise)
-        self.fix_rate = QComboBox()
-        for rate in robot.FIX_RATES:
-            self.fix_rate.addItem(f'{rate:g} Hz', rate)
-        self.fix_rate.setCurrentText('1 Hz')
-        form.addRow('Fix rate', self.fix_rate)
-        self.gyro_noise = self.spin_box(0, .5, .005, .01)
-        form.addRow('Gyro σ (rad/s)', self.gyro_noise)
-        column.addWidget(self.setup)
+            button = QPushButton(name)
+            button.setObjectName('segment')
+            button.setCheckable(True)
+            button.setToolTip(TIPS['route'])
+            button.setProperty('key', key)
+            self.routes.addButton(button)
+            routes.addWidget(button)
+        self.routes.buttons()[0].setChecked(True)
+        column.addLayout(routes)
+        column.addSpacing(6)
+        column.addWidget(section('2  What happens to the sensors'))
+        self.scenarios = QButtonGroup(self)
+        self.scenario_buttons = {}
+        for scenario in SCENARIOS:
+            button = QRadioButton(scenario.name)
+            button.setToolTip(f'{scenario.description}\n\n{TIPS["scenario"]}')
+            button.toggled.connect(lambda on, key=scenario.key: on and self.choose_scenario(key))
+            self.scenarios.addButton(button)
+            self.scenario_buttons[scenario.key] = button
+            column.addWidget(button)
+        self.description = note('')
+        self.description.setObjectName('description')
+        column.addWidget(self.description)
+        column.addSpacing(6)
+        column.addWidget(section('3  Run'))
+        run_row = QHBoxLayout()
         self.launch_button = QPushButton('Launch')
-        self.launch_button.setDefault(True)
+        self.launch_button.setObjectName('primary')
+        self.launch_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.launch_button.setToolTip(TIPS['launch'])
         self.launch_button.clicked.connect(self.launch_or_stop)
-        column.addWidget(self.launch_button)
-        speed_row = QHBoxLayout()
-        speed_row.addWidget(QLabel('Speed'))
+        run_row.addWidget(self.launch_button, 1)
         self.speed = QComboBox()
+        self.speed.setToolTip(TIPS['speed'])
         self.speed.addItems([f'{speed}×' for speed in robot.SPEEDS])
         self.speed.currentIndexChanged.connect(self.send_speed)
         self.speed.setEnabled(False)
-        speed_row.addWidget(self.speed, 1)
-        column.addLayout(speed_row)
+        run_row.addWidget(self.speed)
+        column.addLayout(run_row)
+        column.addWidget(self.build_errors())
+        self.settings_toggle = QToolButton()
+        self.settings_toggle.setObjectName('explainer')
+        self.settings_toggle.setText('Settings')
+        self.settings_toggle.setToolTip(TIPS['settings'])
+        self.settings_toggle.setCheckable(True)
+        self.settings_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.settings_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.settings_toggle.toggled.connect(self.show_settings)
+        column.addWidget(self.settings_toggle)
+        self.settings = self.build_settings()
+        self.settings.setVisible(False)
+        column.addWidget(self.settings)
         column.addStretch()
-        return panel
+        scroll = scrolling(page)
+        scroll.setFixedWidth(SIDEBAR_WIDTH)
+        return scroll
 
-    @staticmethod
-    def spin_box(minimum, maximum, step, value):
-        box = QDoubleSpinBox()
-        box.setRange(minimum, maximum)
-        box.setDecimals(3)
-        box.setSingleStep(step)
-        box.setValue(value)
-        return box
-
-    def build_results(self):
-        # Fixed-width column so changing values never resize the plot.
-        panel = QWidget()
-        panel.setFixedWidth(350)
-        column = QVBoxLayout(panel)
-        column.setContentsMargins(0, 0, 0, 0)
-        group = QGroupBox('Error vs. true position')
+    def build_errors(self):
+        group = QGroupBox('Position error (m)')
         grid = QGridLayout(group)
-        for col, heading in enumerate(('Now (m)', 'RMS (m)', 'Heading (°)'), start=1):
-            grid.addWidget(self.value_label(heading), 0, col)
-        self.errors = {}
-        for row, (name, label) in enumerate((('dr', 'Dead reckoning'), ('ekf', 'EKF')), start=1):
-            grid.addWidget(QLabel(label), row, 0)
-            for col, kind in enumerate(('now', 'rms', 'heading'), start=1):
-                self.errors[f'{name}_{kind}'] = self.value_label('–')
+        for col, (kind, heading) in enumerate((('now', 'Now'), ('rms', 'RMS')), start=1):
+            header = value_label(heading, ERROR_TIPS[kind])
+            header.setObjectName('heading')
+            grid.addWidget(header, 0, col)
+        self.errors, self.error_names = {}, {}
+        for row, name in enumerate(('dr', 'ekf', 'adaptive'), start=1):
+            self.error_names[name] = QLabel()
+            grid.addWidget(self.error_names[name], row, 0)
+            for col, kind in enumerate(('now', 'rms'), start=1):
+                self.errors[f'{name}_{kind}'] = value_label('–', ERROR_TIPS[kind])
                 grid.addWidget(self.errors[f'{name}_{kind}'], row, col)
-        column.addWidget(group)
-        self.sensor_toggle = QToolButton()
-        self.sensor_toggle.setText('Sensor readings')
-        self.sensor_toggle.setCheckable(True)
-        self.sensor_toggle.setArrowType(Qt.ArrowType.RightArrow)
-        self.sensor_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.sensor_toggle.setAutoRaise(True)
-        self.sensor_toggle.toggled.connect(self.show_sensors)
-        column.addWidget(self.sensor_toggle)
-        self.sensor_panel = QGroupBox()
-        form = QFormLayout(self.sensor_panel)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        self.sensors = {}
-        for field, label, _, _ in SENSORS:
-            self.sensors[field] = self.value_label('–')
-            form.addRow(label, self.sensors[field])
-        self.sensor_panel.setVisible(False)
-        column.addWidget(self.sensor_panel)
-        column.addStretch()
-        return panel
+        self.verdict = QLabel('Launch a run to compare the methods.')
+        self.verdict.setObjectName('verdict')
+        self.verdict.setWordWrap(True)
+        grid.addWidget(self.verdict, 4, 0, 1, 3)
+        return group
 
-    @staticmethod
-    def value_label(text):
-        label = QLabel(text)
-        label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        return label
+    def build_settings(self):
+        container = QWidget()
+        column = QVBoxLayout(container)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(8)
 
-    def show_sensors(self, shown):
-        self.sensor_panel.setVisible(shown)
-        self.sensor_toggle.setArrowType(Qt.ArrowType.DownArrow if shown else Qt.ArrowType.RightArrow)
-        self.update_sensors()
+        sensors = QGroupBox('Sensor noise (also during a run)')
+        form = QFormLayout(sensors)
+        self.fix_noise = SliderField(robot.MAX_NOISE['fix_noise'], .01, .1, 3)
+        add_row(form, 'Fix σ (m)', self.fix_noise, TIPS['fix_noise'])
+        self.gyro_noise = SliderField(robot.MAX_NOISE['gyro_noise'], .005, .01, 3)
+        add_row(form, 'Gyro σ (rad/s)', self.gyro_noise, TIPS['gyro_noise'])
+        self.fix_noise.valueChanged.connect(lambda value: self.send_noise('fix_noise', value))
+        self.gyro_noise.valueChanged.connect(lambda value: self.send_noise('gyro_noise', value))
+        column.addWidget(sensors)
 
-    def update_sensors(self):
-        if self.latest is None or not self.sensor_toggle.isChecked():
-            return
-        for field, _, scale, decimals in SENSORS:
-            if self.latest[field] is not None:
-                self.sensors[field].setText(f'{self.latest[field]*scale:.{decimals}f}')
+        self.setup = QGroupBox('Simulation (set at launch)')
+        form = QFormLayout(self.setup)
+        self.fix_rate = QComboBox()
+        for rate in robot.FIX_RATES:
+            self.fix_rate.addItem(f'{rate:g} Hz', rate)
+        add_row(form, 'Fix rate', self.fix_rate, TIPS['fix_rate'])
+        self.outlier_rate = SliderField(50, 1, 0, 0)
+        add_row(form, 'Bad fixes (%)', self.outlier_rate, TIPS['outlier_rate'])
+        self.outlier_noise = SliderField(3, .1, 1, 1)
+        add_row(form, 'Bad fix σ (m)', self.outlier_noise, TIPS['outlier_noise'])
+        self.slip = SliderField(.3, .01, 0, 2)
+        add_row(form, 'Wheel slip σ', self.slip, TIPS['slip'])
+        self.step = QCheckBox('Change the noise at a set time')
+        self.step.setToolTip(TIPS['step'])
+        form.addRow(self.step)
+        self.step_fields = {'time': SliderField(300, 5, 30, 0),
+                            'fix_noise': SliderField(robot.MAX_NOISE['fix_noise'], .01, .1, 3),
+                            'gyro_noise': SliderField(robot.MAX_NOISE['gyro_noise'], .005, .01, 3)}
+        for field, label in (('time', 'At time (s)'), ('fix_noise', 'Fix σ becomes'),
+                             ('gyro_noise', 'Gyro σ becomes')):
+            add_row(form, label, self.step_fields[field], TIPS[f'step_{field}'])
+        self.step.toggled.connect(self.enable_step_fields)
+        self.seed = QSpinBox()
+        self.seed.setRange(0, 999999)
+        self.seed.setValue(42)
+        add_row(form, 'Random seed', self.seed, TIPS['seed'])
+        column.addWidget(self.setup)
+
+        filters = QGroupBox('Filter assumptions')
+        form = QFormLayout(filters)
+        self.match_noise = QCheckBox('Assume the sensor noise above')
+        self.match_noise.setToolTip(TIPS['match_noise'])
+        form.addRow(self.match_noise)
+        self.tuning = {}
+        defaults = EKFSettings()
+        for field, label, maximum, step, decimals, scale in TUNING:
+            box = SliderField(maximum, step, getattr(defaults, field)*scale, decimals)
+            box.valueChanged.connect(self.apply_tuning)
+            self.tuning[field] = box
+            add_row(form, label, box, TIPS[f'tune_{field}'])
+        self.gate = QCheckBox('Reject bad fixes (χ² test)')
+        self.gate.setToolTip(TIPS['gate'])
+        self.gate.toggled.connect(self.apply_tuning)
+        form.addRow(self.gate)
+        column.addWidget(filters)
+
+        adaptive = QGroupBox('Adaptive EKF')
+        form = QFormLayout(adaptive)
+        self.variant = QComboBox()
+        self.variant.addItem('R and gyro σ', 'aekf')
+        self.variant.addItem('R only', 'aekf_r')
+        add_row(form, 'Adapts', self.variant, TIPS['variant'])
+        self.memory = SliderField(120, 1, MEMORY, 0)
+        self.memory.valueChanged.connect(self.apply_tuning)
+        add_row(form, 'Memory (s)', self.memory, TIPS['memory'])
+        column.addWidget(adaptive)
+
+        self.match_noise.toggled.connect(self.match_sensor_noise)
+        self.fix_noise.valueChanged.connect(self.match_sensor_noise)
+        self.gyro_noise.valueChanged.connect(self.match_sensor_noise)
+        self.variant.currentIndexChanged.connect(self.show_names)
+        self.enable_step_fields()
+        self.show_names()
+        return container
+
+    def show_settings(self, shown):
+        self.settings.setVisible(shown)
+        self.settings_toggle.setArrowType(Qt.ArrowType.DownArrow if shown else Qt.ArrowType.RightArrow)
+
+    def show_names(self):
+        variant = self.variant.currentData()
+        for name, key in (('dr', 'dr'), ('ekf', 'ekf'), ('adaptive', variant)):
+            self.error_names[name].setText(NAMES[key])
+            self.error_names[name].setToolTip(ERROR_TIPS[key])
+
+    def enable_step_fields(self):
+        for box in self.step_fields.values():
+            box.setEnabled(self.step.isChecked())
+
+    # Scenario and settings
+
+    def route(self):
+        return self.routes.checkedButton().property('key')
+
+    def choose_scenario(self, key):
+        """Fill every setting from the scenario."""
+        scenario = BY_KEY[key]
+        if not self.scenario_buttons[key].isChecked():
+            self.scenario_buttons[key].setChecked(True)
+        self.description.setText(scenario.description)
+        self.fix_noise.setValue(scenario.fix_noise)
+        self.gyro_noise.setValue(scenario.gyro_noise)
+        self.fix_rate.setCurrentIndex(robot.FIX_RATES.index(scenario.fix_rate))
+        self.outlier_rate.setValue(scenario.outlier_rate*100)
+        self.outlier_noise.setValue(scenario.outlier_noise)
+        self.slip.setValue(scenario.slip)
+        self.step.setChecked(scenario.step_time is not None)
+        if scenario.step_time is not None:
+            self.step_fields['time'].setValue(scenario.step_time)
+            self.step_fields['fix_noise'].setValue(scenario.step_fix_noise or scenario.fix_noise)
+            self.step_fields['gyro_noise'].setValue(scenario.step_gyro_noise or scenario.gyro_noise)
+        settings = scenario.filter_settings()
+        self.match_noise.setChecked(scenario.assumed_fix_noise is None and scenario.assumed_gyro_noise is None)
+        for field, *_, scale in TUNING:
+            self.tuning[field].setValue(getattr(settings, field)*scale)
+        self.match_sensor_noise()
+
+    def match_sensor_noise(self):
+        """With matching on, the filters assume the sensor noise; only before a run, so the
+        EKF keeps its assumptions when the noise changes during one."""
+        matched = self.match_noise.isChecked()
+        for field, sensor in (('fix_noise', self.fix_noise), ('gyro_noise', self.gyro_noise)):
+            self.tuning[field].setEnabled(not matched)
+            if matched and self.process is None:
+                self.tuning[field].setValue(sensor.value())
+
+    def filter_settings(self):
+        values = {field: round(self.tuning[field].value()/scale, 6) for field, *_, scale in TUNING}
+        return EKFSettings(**values, gate=self.gate.isChecked())
+
+    def apply_tuning(self):
+        self.tracker.tune(self.filter_settings(), self.memory.value())
+
+    # Running the simulation
 
     def launch_or_stop(self):
         if self.process is not None:
             self.status.setText('Stopping…')
             self.process.closeWriteChannel()
             return
-        fix_noise, gyro_noise = round(self.fix_noise.value(), 3), round(self.gyro_noise.value(), 3)
-        self.tracker = Tracker(fix_noise=fix_noise, gyro_noise=gyro_noise)
-        self.plot.clear()
+        variant = self.variant.currentData()
+        self.tracker = Tracker(self.filter_settings(), self.memory.value(), adaptive=(variant,))
+        self.plot.configure(('dr', 'ekf', variant))
+        self.noise_plot.configure(variant)
+        self.verdict.setText('Collecting data…')
+        for label in self.errors.values():
+            label.setText('–')
         self.process = QProcess(self)
         self.process.setWorkingDirectory(str(ROOT))
         self.process.readyReadStandardOutput.connect(self.read_link)
@@ -242,26 +312,46 @@ class MainWindow(QMainWindow):
         self.process.errorOccurred.connect(self.simulation_error)
         self.set_running(True)
         self.status.setText('Starting…')
-        arguments = [*self.viewer_command[1:], '--route', self.route.currentData(),
-                     '--speed', str(robot.SPEEDS[self.speed.currentIndex()]), '--seed', str(SEED),
-                     '--gyro-noise', f'{gyro_noise:g}', '--fix-noise', f'{fix_noise:g}',
-                     '--fix-rate', f'{self.fix_rate.currentData():g}']
+        number = lambda value: f'{round(value, 3):g}'
+        arguments = [*self.viewer_command[1:], '--route', self.route(),
+                     '--speed', str(robot.SPEEDS[self.speed.currentIndex()]), '--seed', str(self.seed.value()),
+                     '--gyro-noise', number(self.gyro_noise.value()), '--fix-noise', number(self.fix_noise.value()),
+                     '--fix-rate', number(self.fix_rate.currentData()),
+                     '--outlier-rate', number(self.outlier_rate.value()/100),
+                     '--outlier-noise', number(self.outlier_noise.value()), '--slip', number(self.slip.value())]
+        self.step_pending = self.step.isChecked()
+        if self.step_pending:
+            arguments += ['--step-time', number(self.step_fields['time'].value()),
+                          '--step-fix-noise', number(self.step_fields['fix_noise'].value()),
+                          '--step-gyro-noise', number(self.step_fields['gyro_noise'].value())]
         self.process.start(self.viewer_command[0], arguments)
 
     def set_running(self, running):
-        self.setup.setEnabled(not running)
+        for widget in (self.setup, self.variant, self.tuning['initial_sigma'], *self.routes.buttons(),
+                       *self.scenario_buttons.values()):
+            widget.setEnabled(not running)
         self.speed.setEnabled(running)
         self.launch_button.setText('Stop' if running else 'Launch')
+        # The stylesheet turns the button red while running.
+        self.launch_button.setProperty('running', running)
+        self.launch_button.style().unpolish(self.launch_button)
+        self.launch_button.style().polish(self.launch_button)
+
+    def send(self, command):
+        if self.process is not None and self.process.state() == QProcess.ProcessState.Running:
+            self.process.write(f'{command}\n'.encode())
 
     def send_speed(self):
-        if self.process is not None and self.process.state() == QProcess.ProcessState.Running:
-            self.process.write(f'speed {robot.SPEEDS[self.speed.currentIndex()]}\n'.encode())
+        self.send(f'speed {robot.SPEEDS[self.speed.currentIndex()]}')
+
+    def send_noise(self, field, value):
+        self.send(f'{field} {round(value, 3):g}')
 
     def read_link(self):
         while self.process is not None and self.process.canReadLine():
             line = bytes(self.process.readLine()).decode().strip()
             if line == 'ready':
-                self.status.setText('Linked')
+                self.status.setText('Running')
             elif line:
                 try:
                     sample = robot.decode_sample(line)
@@ -270,15 +360,26 @@ class MainWindow(QMainWindow):
                 self.show_sample(sample)
 
     def show_sample(self, sample):
+        if self.step_pending and sample['time'] >= self.step_fields['time'].value():
+            # The simulation has made the scripted step: show the new noise in the sliders.
+            self.step_pending = False
+            for field in ('fix_noise', 'gyro_noise'):
+                getattr(self, field).setValue(self.step_fields[field].value())
         self.tracker.add(sample)
-        self.status.setText(f"Linked · t = {sample['time']:.1f} s")
-        for key, value in self.tracker.errors().items():
-            self.errors[key].setText(f'{math.degrees(value):.1f}' if key.endswith('heading') else f'{value:.3f}')
-        if sample['fix_x'] is not None:
-            self.last_fix = {'fix_x': sample['fix_x'], 'fix_y': sample['fix_y']}
-        self.latest = {**sample, **self.last_fix}
-        self.update_sensors()
+        self.latest = sample
+        self.status.setText(f"Running · t = {sample['time']:.1f} s")
+        errors = self.tracker.errors()
+        variant = self.tracker.adaptive[0]
+        for name, key in (('dr', 'dr'), ('ekf', 'ekf'), ('adaptive', variant)):
+            for kind in ('now', 'rms'):
+                self.errors[f'{name}_{kind}'].setText(f'{errors[f"{key}_{kind}"]:.3f}')
+        if sample['time'] >= VERDICT_AFTER:
+            change = errors[f'{variant}_rms'] / max(errors['ekf_rms'], 1e-12) - 1
+            word = 'lower' if change < 0 else 'higher'
+            self.verdict.setText(f"So far the {NAMES[variant]}'s RMS error is "
+                                 f"{abs(change)*100:.0f}% {word} than the EKF's.")
         self.plot.refresh(self.tracker, force=self.tracker.count <= 2)
+        self.noise_plot.refresh(self.tracker)
 
     def simulation_closed(self):
         self.process = None
@@ -286,14 +387,16 @@ class MainWindow(QMainWindow):
         self.status.setText('Simulation closed')
         if self.tracker.count:
             self.plot.refresh(self.tracker, force=True)
+            self.noise_plot.refresh(self.tracker, force=True)
 
     def simulation_error(self, error):
         if error == QProcess.ProcessError.FailedToStart:
             self.process = None
             self.set_running(False)
-            self.status.setText('Could not start simulation')
+            self.status.setText('Could not start the simulation')
 
-    def closeEvent(self, event):
+    def stop(self):
+        """Close the simulation (when the app quits)."""
         if self.process is not None:
             process = self.process
             process.finished.disconnect(self.simulation_closed)
@@ -302,12 +405,51 @@ class MainWindow(QMainWindow):
                 process.kill()
                 process.waitForFinished(1000)
             self.process = None
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, viewer_command=None):
+        super().__init__()
+        self.setWindowTitle('Adaptive EKF Localization')
+        self.resize(1320, 840)
+        dark = QApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
+        theme = THEMES['dark' if dark else 'light']
+        self.setStyleSheet(stylesheet(theme))
+        self.status = QLabel('Not running')
+        self.statusBar().addWidget(self.status)
+        self.pages = QTabWidget()
+        self.pages.setObjectName('pages')
+        self.pages.setDocumentMode(True)
+        self.live = LivePage(theme, self.status, viewer_command)
+        self.experiment = ExperimentPage(theme)
+        help_label = QLabel(HELP)
+        help_label.setObjectName('help')
+        help_label.setWordWrap(True)
+        help_label.setTextFormat(Qt.TextFormat.RichText)
+        help_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        help_label.setMaximumWidth(820)
+        help_page = QWidget()
+        QHBoxLayout(help_page).addWidget(help_label)
+        for page, title in ((self.live, 'Live demo'), (self.experiment, 'Experiment'),
+                            (scrolling(help_page), 'How it works')):
+            holder = QWidget()
+            holder.setObjectName('root')
+            layout = QVBoxLayout(holder)
+            layout.setContentsMargins(14, 10, 14, 8)
+            layout.addWidget(page)
+            self.pages.addTab(holder, title)
+        self.setCentralWidget(self.pages)
+
+    def closeEvent(self, event):
+        self.live.stop()
+        self.experiment.stop()
         event.accept()
 
 
 def main():
     application = QApplication(sys.argv[:1])
     application.setApplicationName('Adaptive EKF Localization')
+    application.setStyle('Fusion')  # renders the stylesheet the same on every platform
     window = MainWindow()
     window.show()
     sys.exit(application.exec())
